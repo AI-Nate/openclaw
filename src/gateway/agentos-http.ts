@@ -288,7 +288,8 @@ async function handleMemoryFiles(
   return true;
 }
 
-type ToolCallEntry = { name: string; description: string; timestamp: string; status: string };
+type ToolCall = { name: string; description: string };
+type ToolGroup = { query: string; tools: ToolCall[]; timestamp: string };
 
 function summarizeToolCall(name: string, args: Record<string, unknown>): string {
   if (name === "web_fetch") return String(args.url ?? args.query ?? "");
@@ -329,41 +330,66 @@ async function handleToolHistory(
 
     const loaded = loadSessionEntry(sessionKey);
     if (!loaded?.entry?.sessionId) {
-      sendJson(res, 200, { tools: [] });
+      sendJson(res, 200, { groups: [] });
       return true;
     }
 
-    // Read raw JSONL to access envelope timestamps and toolCall parts
     const candidates = resolveSessionTranscriptCandidates(
       loaded.entry.sessionId, loaded.storePath, loaded.entry.sessionFile,
     );
     const filePath = candidates.find((p) => fs.existsSync(p));
-    const tools: ToolCallEntry[] = [];
+    const groups: ToolGroup[] = [];
 
     if (filePath) {
       const lines = fs.readFileSync(filePath, "utf-8").split(/\r?\n/);
+      let currentQuery = "";
+      let currentTools: ToolCall[] = [];
+      let currentTs = "";
+
       for (const line of lines) {
         if (!line.trim()) continue;
         try {
           const parsed = JSON.parse(line);
           if (parsed?.type !== "message") continue;
-          const ts = parsed.timestamp ?? "";
+          const role = parsed.message?.role;
           const content = parsed.message?.content;
-          if (!Array.isArray(content)) continue;
-          for (const part of content) {
-            if (part?.type !== "toolCall" || !part.name) continue;
-            tools.push({
-              name: part.name,
-              description: summarizeToolCall(part.name, part.arguments ?? {}),
-              timestamp: ts,
-              status: "completed",
-            });
+          const ts = parsed.timestamp ?? "";
+
+          if (role === "user") {
+            // Flush previous group
+            if (currentTools.length > 0) {
+              groups.push({ query: currentQuery, tools: currentTools, timestamp: currentTs });
+            }
+            currentTools = [];
+            currentTs = ts;
+            // Extract user query text
+            if (typeof content === "string") {
+              currentQuery = stripDiscordMeta(content).slice(0, 120);
+            } else if (Array.isArray(content)) {
+              const textPart = content.find((p: { type?: string }) => p?.type === "text");
+              currentQuery = stripDiscordMeta(String(textPart?.text ?? "")).slice(0, 120);
+            }
+          }
+
+          if (role === "assistant" && Array.isArray(content)) {
+            for (const part of content) {
+              if (part?.type !== "toolCall" || !part.name) continue;
+              if (!currentTs) currentTs = ts;
+              currentTools.push({
+                name: part.name,
+                description: summarizeToolCall(part.name, part.arguments ?? {}),
+              });
+            }
           }
         } catch { /* skip bad lines */ }
       }
+      // Flush last group
+      if (currentTools.length > 0) {
+        groups.push({ query: currentQuery, tools: currentTools, timestamp: currentTs });
+      }
     }
 
-    sendJson(res, 200, { tools: tools.slice(-limit) });
+    sendJson(res, 200, { groups: groups.slice(-limit) });
   } catch (err) {
     sendJson(res, 500, { error: { message: String(err), type: "api_error" } });
   }
