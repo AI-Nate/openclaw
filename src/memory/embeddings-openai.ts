@@ -25,7 +25,9 @@ export async function createOpenAiEmbeddingProvider(
   options: EmbeddingProviderOptions,
 ): Promise<{ provider: EmbeddingProvider; client: OpenAiEmbeddingClient }> {
   const client = await resolveOpenAiEmbeddingClient(options);
-  const url = `${client.baseUrl.replace(/\/$/, "")}/embeddings`;
+  // Azure OpenAI: baseUrl already includes /embeddings?api-version=..., don't append
+  const base = client.baseUrl.replace(/\/$/, "");
+  const url = /\/embeddings(\?|$)/.test(base) ? base : `${base}/embeddings`;
 
   const embed = async (input: string[]): Promise<number[][]> => {
     if (input.length === 0) {
@@ -68,23 +70,28 @@ export async function resolveOpenAiEmbeddingClient(
   const remoteApiKey = remote?.apiKey?.trim();
   const remoteBaseUrl = remote?.baseUrl?.trim();
 
-  const apiKey = remoteApiKey
-    ? remoteApiKey
-    : requireApiKey(
-        await resolveApiKeyForProvider({
-          provider: "openai",
-          cfg: options.config,
-          agentDir: options.agentDir,
-        }),
-        "openai",
-      );
-
   const providerConfig = options.config.models?.providers?.openai;
   const baseUrl = remoteBaseUrl || providerConfig?.baseUrl?.trim() || DEFAULT_OPENAI_BASE_URL;
   const headerOverrides = Object.assign({}, providerConfig?.headers, remote?.headers);
+  // Azure OpenAI uses "api-key" header; skip Bearer token when custom auth is provided
+  const hasCustomAuth = "api-key" in headerOverrides || "Authorization" in headerOverrides;
+
+  let apiKey = remoteApiKey || "";
+  if (!hasCustomAuth) {
+    apiKey = apiKey
+      || requireApiKey(
+          await resolveApiKeyForProvider({
+            provider: "openai",
+            cfg: options.config,
+            agentDir: options.agentDir,
+          }),
+          "openai",
+        );
+  }
+
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${apiKey}`,
+    ...(hasCustomAuth ? {} : { Authorization: `Bearer ${apiKey}` }),
     ...headerOverrides,
   };
   const model = normalizeOpenAiModel(options.model);
