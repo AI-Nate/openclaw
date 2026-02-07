@@ -12,7 +12,7 @@ import {
 } from "./http-common.js";
 import { getBearerToken, getHeader } from "./http-utils.js";
 import { loadSessionEntry, listAgentsForGateway } from "./session-utils.js";
-import { readSessionMessages } from "./session-utils.fs.js";
+import { readSessionMessages, resolveSessionTranscriptCandidates } from "./session-utils.fs.js";
 
 type AgentosHttpOptions = {
   auth: ResolvedGatewayAuth;
@@ -333,24 +333,33 @@ async function handleToolHistory(
       return true;
     }
 
-    const raw = readSessionMessages(loaded.entry.sessionId, loaded.storePath, loaded.entry.sessionFile);
+    // Read raw JSONL to access envelope timestamps and toolCall parts
+    const candidates = resolveSessionTranscriptCandidates(
+      loaded.entry.sessionId, loaded.storePath, loaded.entry.sessionFile,
+    );
+    const filePath = candidates.find((p) => fs.existsSync(p));
     const tools: ToolCallEntry[] = [];
 
-    for (const msg of raw) {
-      const m = msg as { type?: string; timestamp?: string; message?: { content?: unknown } };
-      if (m.type !== "message") continue;
-      const content = m.message?.content;
-      if (!Array.isArray(content)) continue;
-      const ts = m.timestamp ?? "";
-      for (const part of content) {
-        const p = part as { type?: string; name?: string; arguments?: Record<string, unknown> };
-        if (p.type !== "toolCall" || !p.name) continue;
-        tools.push({
-          name: p.name,
-          description: summarizeToolCall(p.name, p.arguments ?? {}),
-          timestamp: ts,
-          status: "completed",
-        });
+    if (filePath) {
+      const lines = fs.readFileSync(filePath, "utf-8").split(/\r?\n/);
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed?.type !== "message") continue;
+          const ts = parsed.timestamp ?? "";
+          const content = parsed.message?.content;
+          if (!Array.isArray(content)) continue;
+          for (const part of content) {
+            if (part?.type !== "toolCall" || !part.name) continue;
+            tools.push({
+              name: part.name,
+              description: summarizeToolCall(part.name, part.arguments ?? {}),
+              timestamp: ts,
+              status: "completed",
+            });
+          }
+        } catch { /* skip bad lines */ }
       }
     }
 
