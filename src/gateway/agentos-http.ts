@@ -41,6 +41,9 @@ export async function handleAgentosHttpRequest(
   if (url.pathname === "/v1/memory/files") {
     return handleMemoryFiles(req, res, opts);
   }
+  if (url.pathname === "/v1/history/tools") {
+    return handleToolHistory(req, res, opts);
+  }
 
   return false;
 }
@@ -279,6 +282,79 @@ async function handleMemoryFiles(
     }
 
     sendJson(res, 200, { files });
+  } catch (err) {
+    sendJson(res, 500, { error: { message: String(err), type: "api_error" } });
+  }
+  return true;
+}
+
+type ToolCallEntry = { name: string; description: string; timestamp: string; status: string };
+
+function summarizeToolCall(name: string, args: Record<string, unknown>): string {
+  if (name === "web_fetch") return String(args.url ?? args.query ?? "");
+  if (name === "web_search") return String(args.query ?? "");
+  if (name === "write") return String(args.path ?? "").split("/").pop() ?? "";
+  if (name === "read") return String(args.path ?? "").split("/").pop() ?? "";
+  if (name === "exec") return String(args.command ?? "").slice(0, 80);
+  if (name === "memory_search") return String(args.query ?? "");
+  const first = Object.values(args)[0];
+  return typeof first === "string" ? first.slice(0, 80) : "";
+}
+
+async function handleToolHistory(
+  req: IncomingMessage,
+  res: ServerResponse,
+  opts: AgentosHttpOptions,
+): Promise<boolean> {
+  if (req.method !== "GET") {
+    sendMethodNotAllowed(res, "GET");
+    return true;
+  }
+  if (!(await authorize(req, res, opts))) {
+    return true;
+  }
+
+  try {
+    const sessionKey = getHeader(req, "x-openclaw-session-key")?.trim() ?? "";
+    if (!sessionKey) {
+      sendJson(res, 400, {
+        error: { message: "Missing X-OpenClaw-Session-Key header.", type: "invalid_request_error" },
+      });
+      return true;
+    }
+
+    const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
+    const limitParam = url.searchParams.get("limit");
+    const limit = limitParam ? Math.min(Math.max(parseInt(limitParam, 10) || 50, 1), 200) : 50;
+
+    const loaded = loadSessionEntry(sessionKey);
+    if (!loaded?.entry?.sessionId) {
+      sendJson(res, 200, { tools: [] });
+      return true;
+    }
+
+    const raw = readSessionMessages(loaded.entry.sessionId, loaded.storePath, loaded.entry.sessionFile);
+    const tools: ToolCallEntry[] = [];
+
+    for (const msg of raw) {
+      const m = msg as { type?: string; timestamp?: string; message?: { content?: unknown } };
+      if (m.type !== "message") continue;
+      const content = m.message?.content;
+      if (!Array.isArray(content)) continue;
+      const ts = m.timestamp ?? "";
+      for (const part of content) {
+        const p = part as { type?: string; name?: string; arguments?: Record<string, unknown> };
+        if (p.type !== "toolCall" || !p.name) continue;
+        tools.push({
+          name: p.name,
+          description: summarizeToolCall(p.name, p.arguments ?? {}),
+          timestamp: ts,
+          status: "completed",
+        });
+      }
+    }
+
+    sendJson(res, 200, { tools: tools.slice(-limit) });
   } catch (err) {
     sendJson(res, 500, { error: { message: String(err), type: "api_error" } });
   }
