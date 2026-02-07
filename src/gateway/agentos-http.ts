@@ -1,4 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import fs from "node:fs";
+import path from "node:path";
 import { loadConfig } from "../config/config.js";
 import { getMemorySearchManager } from "../memory/search-manager.js";
 import { authorizeGatewayConnect, type ResolvedGatewayAuth } from "./auth.js";
@@ -35,6 +37,9 @@ export async function handleAgentosHttpRequest(
   }
   if (url.pathname === "/v1/history") {
     return handleHistory(req, res, opts);
+  }
+  if (url.pathname === "/v1/memory/files") {
+    return handleMemoryFiles(req, res, opts);
   }
 
   return false;
@@ -219,6 +224,61 @@ async function handleHistory(
     }
 
     sendJson(res, 200, { messages: messages.slice(-limit) });
+  } catch (err) {
+    sendJson(res, 500, { error: { message: String(err), type: "api_error" } });
+  }
+  return true;
+}
+
+async function handleMemoryFiles(
+  req: IncomingMessage,
+  res: ServerResponse,
+  opts: AgentosHttpOptions,
+): Promise<boolean> {
+  if (req.method !== "GET") {
+    sendMethodNotAllowed(res, "GET");
+    return true;
+  }
+  if (!(await authorize(req, res, opts))) {
+    return true;
+  }
+
+  try {
+    const cfg = loadConfig();
+    const workspace = cfg.agents?.defaults?.workspace
+      ?? path.join(process.env.HOME ?? "/tmp", ".openclaw", "workspace");
+
+    const files: Array<{ name: string; content: string; size: number; modified: string }> = [];
+
+    // Read MEMORY.md
+    const memoryMd = path.join(workspace, "MEMORY.md");
+    if (fs.existsSync(memoryMd)) {
+      const stat = fs.statSync(memoryMd);
+      files.push({
+        name: "MEMORY.md",
+        content: fs.readFileSync(memoryMd, "utf-8"),
+        size: stat.size,
+        modified: stat.mtime.toISOString(),
+      });
+    }
+
+    // Read memory/*.md
+    const memoryDir = path.join(workspace, "memory");
+    if (fs.existsSync(memoryDir)) {
+      for (const entry of fs.readdirSync(memoryDir)) {
+        if (!entry.endsWith(".md")) continue;
+        const filePath = path.join(memoryDir, entry);
+        const stat = fs.statSync(filePath);
+        files.push({
+          name: `memory/${entry}`,
+          content: fs.readFileSync(filePath, "utf-8"),
+          size: stat.size,
+          modified: stat.mtime.toISOString(),
+        });
+      }
+    }
+
+    sendJson(res, 200, { files });
   } catch (err) {
     sendJson(res, 500, { error: { message: String(err), type: "api_error" } });
   }
