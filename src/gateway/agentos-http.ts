@@ -8,8 +8,9 @@ import {
   sendMethodNotAllowed,
   sendUnauthorized,
 } from "./http-common.js";
-import { getBearerToken } from "./http-utils.js";
-import { listAgentsForGateway } from "./session-utils.js";
+import { getBearerToken, getHeader } from "./http-utils.js";
+import { loadSessionEntry, listAgentsForGateway } from "./session-utils.js";
+import { readSessionMessages } from "./session-utils.fs.js";
 
 type AgentosHttpOptions = {
   auth: ResolvedGatewayAuth;
@@ -31,6 +32,9 @@ export async function handleAgentosHttpRequest(
   }
   if (url.pathname === "/v1/agents") {
     return handleAgentsList(req, res, opts);
+  }
+  if (url.pathname === "/v1/history") {
+    return handleHistory(req, res, opts);
   }
 
   return false;
@@ -141,6 +145,80 @@ async function handleAgentsList(
     const cfg = loadConfig();
     const { agents, defaultId } = listAgentsForGateway(cfg);
     sendJson(res, 200, { agents, defaultId });
+  } catch (err) {
+    sendJson(res, 500, { error: { message: String(err), type: "api_error" } });
+  }
+  return true;
+}
+
+type ContentPart = { type?: string; text?: string };
+
+function extractText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return (content as ContentPart[])
+      .filter((p) => typeof p?.text === "string")
+      .map((p) => p.text!)
+      .join("\n");
+  }
+  return "";
+}
+
+/** Strip Discord metadata lines from user messages.
+ *  e.g. "[Discord ai_nate user id:... UTC] actual message\n[message_id: ...]" → "actual message" */
+function stripDiscordMeta(text: string): string {
+  // Remove leading "[Discord ... UTC] " prefix
+  let cleaned = text.replace(/^\[Discord [^\]]*\]\s*/s, "");
+  // Remove trailing "[message_id: ...]" line
+  cleaned = cleaned.replace(/\n?\[message_id:\s*\d+\]\s*$/, "");
+  return cleaned.trim();
+}
+
+async function handleHistory(
+  req: IncomingMessage,
+  res: ServerResponse,
+  opts: AgentosHttpOptions,
+): Promise<boolean> {
+  if (req.method !== "GET") {
+    sendMethodNotAllowed(res, "GET");
+    return true;
+  }
+  if (!(await authorize(req, res, opts))) {
+    return true;
+  }
+
+  try {
+    const sessionKey = getHeader(req, "x-openclaw-session-key")?.trim() ?? "";
+    if (!sessionKey) {
+      sendJson(res, 400, {
+        error: { message: "Missing X-OpenClaw-Session-Key header.", type: "invalid_request_error" },
+      });
+      return true;
+    }
+
+    const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
+    const limitParam = url.searchParams.get("limit");
+    const limit = limitParam ? Math.min(Math.max(parseInt(limitParam, 10) || 50, 1), 200) : 50;
+
+    const loaded = loadSessionEntry(sessionKey);
+    if (!loaded?.entry?.sessionId) {
+      sendJson(res, 200, { messages: [] });
+      return true;
+    }
+
+    const raw = readSessionMessages(loaded.entry.sessionId, loaded.storePath, loaded.entry.sessionFile);
+    // Map to simplified message format, only user + assistant, take last N
+    const messages: Array<{ role: string; content: string }> = [];
+    for (const msg of raw) {
+      const m = msg as { role?: string; content?: unknown };
+      if (m.role !== "user" && m.role !== "assistant") continue;
+      let text = extractText(m.content);
+      if (m.role === "user") text = stripDiscordMeta(text);
+      if (!text.trim()) continue;
+      messages.push({ role: m.role, content: text });
+    }
+
+    sendJson(res, 200, { messages: messages.slice(-limit) });
   } catch (err) {
     sendJson(res, 500, { error: { message: String(err), type: "api_error" } });
   }
